@@ -10,8 +10,18 @@ from app.schemas.appointment import (
     AppointmentRescheduleRequest,
     AppointmentCancelRequest,
 )
+from app.exceptions import StaleAppointmentException
 
 class AppointmentService:
+    @staticmethod
+    def _verify_version(appointment: Appointment, expected_version: int) -> None:
+        """
+        Reusable helper to verify optimistic concurrency control version.
+        Raises StaleAppointmentException (HTTP 409) if versions mismatch.
+        """
+        if appointment.version != expected_version:
+            raise StaleAppointmentException(current_version=appointment.version)
+
     @staticmethod
     def get_appointments(db: Session, role: Optional[str] = None, user_id: Optional[str] = None) -> List[Appointment]:
         query = db.query(Appointment)
@@ -54,14 +64,15 @@ class AppointmentService:
 
     @staticmethod
     def confirm_appointment(
-        db: Session, appointment_id: int, request: Optional[AppointmentConfirmRequest] = None
+        db: Session, appointment_id: int, request: AppointmentConfirmRequest
     ) -> Appointment:
         appointment = AppointmentService.get_appointment_by_id(db, appointment_id)
+        AppointmentService._verify_version(appointment, request.expected_version)
         
         if appointment.status != AppointmentStatus.PENDING:
             raise HTTPException(status_code=400, detail="Only pending appointments can be confirmed.")
         
-        if request and request.scheduled_start:
+        if request.scheduled_start:
             appointment.scheduled_start = request.scheduled_start
             appointment.scheduled_end = request.scheduled_start + timedelta(minutes=30)
         elif not appointment.scheduled_start:
@@ -69,6 +80,7 @@ class AppointmentService:
             appointment.scheduled_end = appointment.requested_start + timedelta(minutes=30)
 
         appointment.status = AppointmentStatus.CONFIRMED
+        appointment.version += 1
         appointment.updated_at = datetime.now(timezone.utc)
         
         db.commit()
@@ -80,6 +92,7 @@ class AppointmentService:
         db: Session, appointment_id: int, request: AppointmentRescheduleRequest
     ) -> Appointment:
         appointment = AppointmentService.get_appointment_by_id(db, appointment_id)
+        AppointmentService._verify_version(appointment, request.expected_version)
         
         target_start = request.target_start
         if not target_start:
@@ -87,6 +100,7 @@ class AppointmentService:
 
         appointment.scheduled_start = target_start
         appointment.scheduled_end = target_start + timedelta(minutes=30)
+        appointment.version += 1
         appointment.updated_at = datetime.now(timezone.utc)
         
         db.commit()
@@ -95,14 +109,16 @@ class AppointmentService:
 
     @staticmethod
     def cancel_appointment(
-        db: Session, appointment_id: int, request: Optional[AppointmentCancelRequest] = None
+        db: Session, appointment_id: int, request: AppointmentCancelRequest
     ) -> Appointment:
         appointment = AppointmentService.get_appointment_by_id(db, appointment_id)
+        AppointmentService._verify_version(appointment, request.expected_version)
         
         if appointment.status != AppointmentStatus.CONFIRMED:
             raise HTTPException(status_code=400, detail="Only confirmed appointments can be cancelled.")
         
         appointment.status = AppointmentStatus.CANCELLED
+        appointment.version += 1
         appointment.updated_at = datetime.now(timezone.utc)
         
         db.commit()

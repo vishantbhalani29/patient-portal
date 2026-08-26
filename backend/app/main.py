@@ -1,9 +1,12 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+
 from app.database import engine, Base, SessionLocal
 from app.api import health, appointments
 from app.services.appointment_service import AppointmentService
+from app.exceptions import StaleAppointmentException
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -22,6 +25,17 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan
 )
+
+@app.exception_handler(StaleAppointmentException)
+async def stale_appointment_exception_handler(request: Request, exc: StaleAppointmentException):
+    return JSONResponse(
+        status_code=409,
+        content={
+            "code": "STALE_APPOINTMENT",
+            "message": "This appointment was updated by another user.",
+            "current_version": exc.current_version
+        }
+    )
 
 app.add_middleware(
     CORSMiddleware,

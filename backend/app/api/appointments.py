@@ -37,7 +37,7 @@ def create_appointment(
 @router.post("/appointments/{id}/confirm", response_model=AppointmentResponse)
 def confirm_appointment(
     id: int,
-    request: Optional[AppointmentConfirmRequest] = None,
+    request: AppointmentConfirmRequest,
     db: Session = Depends(get_db),
 ):
     """
@@ -59,7 +59,7 @@ def reschedule_appointment(
 @router.post("/appointments/{id}/cancel", response_model=AppointmentResponse)
 def cancel_appointment(
     id: int,
-    request: Optional[AppointmentCancelRequest] = None,
+    request: AppointmentCancelRequest,
     db: Session = Depends(get_db),
 ):
     """
