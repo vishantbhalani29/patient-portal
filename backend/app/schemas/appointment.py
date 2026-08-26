@@ -37,8 +37,13 @@ class AppointmentConfirmRequest(BaseModel):
     expected_version: Optional[int] = None
 
 class AppointmentRescheduleRequest(BaseModel):
-    new_start: datetime
+    scheduled_start: Optional[datetime] = None
+    new_start: Optional[datetime] = None
     expected_version: Optional[int] = None
+
+    @property
+    def target_start(self) -> Optional[datetime]:
+        return self.scheduled_start or self.new_start
 
 class AppointmentCancelRequest(BaseModel):
     expected_version: Optional[int] = None
