@@ -12,7 +12,7 @@ from app.schemas.appointment import (
     AppointmentRescheduleRequest,
     AppointmentCancelRequest,
 )
-from app.exceptions import StaleAppointmentException
+from app.exceptions import StaleAppointmentException, ProviderScheduleConflictException
 
 class AppointmentService:
     @staticmethod
@@ -71,6 +71,34 @@ class AppointmentService:
         """
         if appointment.version != expected_version:
             raise StaleAppointmentException(current_version=appointment.version)
+
+    @staticmethod
+    def _validate_provider_availability(
+        db: Session,
+        provider_id: str,
+        start_time: datetime,
+        end_time: datetime,
+        exclude_appointment_id: int,
+    ) -> None:
+        """
+        Validates that a provider has no overlapping CONFIRMED appointments.
+        Overlap condition: new_start < existing_end AND new_end > existing_start.
+        Raises ProviderScheduleConflictException (HTTP 409) if an overlap exists.
+        """
+        conflict = (
+            db.query(Appointment)
+            .filter(
+                Appointment.provider_id == provider_id,
+                Appointment.status == AppointmentStatus.CONFIRMED,
+                Appointment.id != exclude_appointment_id,
+                Appointment.scheduled_start < end_time,
+                Appointment.scheduled_end > start_time,
+            )
+            .first()
+        )
+
+        if conflict:
+            raise ProviderScheduleConflictException()
 
     @staticmethod
     def get_appointments(db: Session, role: Optional[str] = None, user_id: Optional[str] = None) -> List[Appointment]:
@@ -140,25 +168,38 @@ class AppointmentService:
     def confirm_appointment(
         db: Session, appointment_id: int, request: AppointmentConfirmRequest
     ) -> Appointment:
+        # 1. Load appointment
         appointment = AppointmentService.get_appointment_by_id(db, appointment_id)
+        
+        # 2. Validate version
         AppointmentService._verify_version(appointment, request.expected_version)
         
         if appointment.status != AppointmentStatus.PENDING:
             raise HTTPException(status_code=400, detail="Only pending appointments can be confirmed.")
         
+        target_start = request.scheduled_start or appointment.scheduled_start or appointment.requested_start
+        target_end = target_start + timedelta(minutes=30)
+
+        # 3. Validate provider availability
+        AppointmentService._validate_provider_availability(
+            db=db,
+            provider_id=appointment.provider_id,
+            start_time=target_start,
+            end_time=target_end,
+            exclude_appointment_id=appointment.id,
+        )
+
+        # 4. Capture before_state
         before_state = AppointmentService._capture_snapshot(appointment)
 
-        if request.scheduled_start:
-            appointment.scheduled_start = request.scheduled_start
-            appointment.scheduled_end = request.scheduled_start + timedelta(minutes=30)
-        elif not appointment.scheduled_start:
-            appointment.scheduled_start = appointment.requested_start
-            appointment.scheduled_end = appointment.requested_start + timedelta(minutes=30)
-
+        # 5. Apply mutation & 6. Increment version
+        appointment.scheduled_start = target_start
+        appointment.scheduled_end = target_end
         appointment.status = AppointmentStatus.CONFIRMED
         appointment.version += 1
         appointment.updated_at = datetime.now(timezone.utc)
         
+        # 7. Capture after_state & Create audit event
         after_state = AppointmentService._capture_snapshot(appointment)
         actor_id = request.actor_id or appointment.provider_id
         actor_role = request.actor_role or "provider"
@@ -173,6 +214,7 @@ class AppointmentService:
             after_state=after_state,
         )
 
+        # 8. Commit
         db.commit()
         db.refresh(appointment)
         return appointment
@@ -181,20 +223,37 @@ class AppointmentService:
     def reschedule_appointment(
         db: Session, appointment_id: int, request: AppointmentRescheduleRequest
     ) -> Appointment:
+        # 1. Load appointment
         appointment = AppointmentService.get_appointment_by_id(db, appointment_id)
+        
+        # 2. Validate version
         AppointmentService._verify_version(appointment, request.expected_version)
         
         target_start = request.target_start
         if not target_start:
             raise HTTPException(status_code=400, detail="scheduled_start is required for rescheduling.")
 
+        target_end = target_start + timedelta(minutes=30)
+
+        # 3. Validate provider availability
+        AppointmentService._validate_provider_availability(
+            db=db,
+            provider_id=appointment.provider_id,
+            start_time=target_start,
+            end_time=target_end,
+            exclude_appointment_id=appointment.id,
+        )
+
+        # 4. Capture before_state
         before_state = AppointmentService._capture_snapshot(appointment)
 
+        # 5. Apply mutation & 6. Increment version
         appointment.scheduled_start = target_start
-        appointment.scheduled_end = target_start + timedelta(minutes=30)
+        appointment.scheduled_end = target_end
         appointment.version += 1
         appointment.updated_at = datetime.now(timezone.utc)
         
+        # 7. Capture after_state & Create audit event
         after_state = AppointmentService._capture_snapshot(appointment)
         actor_id = request.actor_id or appointment.provider_id
         actor_role = request.actor_role or "provider"
@@ -209,6 +268,7 @@ class AppointmentService:
             after_state=after_state,
         )
 
+        # 8. Commit
         db.commit()
         db.refresh(appointment)
         return appointment
@@ -217,18 +277,24 @@ class AppointmentService:
     def cancel_appointment(
         db: Session, appointment_id: int, request: AppointmentCancelRequest
     ) -> Appointment:
+        # 1. Load appointment
         appointment = AppointmentService.get_appointment_by_id(db, appointment_id)
+        
+        # 2. Validate version
         AppointmentService._verify_version(appointment, request.expected_version)
         
         if appointment.status != AppointmentStatus.CONFIRMED:
             raise HTTPException(status_code=400, detail="Only confirmed appointments can be cancelled.")
         
+        # Capture before_state
         before_state = AppointmentService._capture_snapshot(appointment)
 
+        # Apply mutation & Increment version
         appointment.status = AppointmentStatus.CANCELLED
         appointment.version += 1
         appointment.updated_at = datetime.now(timezone.utc)
         
+        # Capture after_state & Create audit event
         after_state = AppointmentService._capture_snapshot(appointment)
         actor_id = request.actor_id or appointment.patient_id
         actor_role = request.actor_role or "patient"
@@ -243,6 +309,7 @@ class AppointmentService:
             after_state=after_state,
         )
 
+        # Commit
         db.commit()
         db.refresh(appointment)
         return appointment

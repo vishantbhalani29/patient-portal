@@ -352,7 +352,6 @@ def test_history_endpoint_returns_404_for_non_existent_appointment(client):
 
 @patch.object(NotificationService, "send_confirmation_notification")
 def test_confirm_endpoint_schedules_notification(mock_notify, client):
-    # Appt 2 is pending
     response = client.post("/api/appointments/2/confirm", json={"expected_version": 1})
     assert response.status_code == 200
     assert mock_notify.called
@@ -364,19 +363,16 @@ def test_confirm_endpoint_schedules_notification(mock_notify, client):
 
 @patch.object(NotificationService, "send_confirmation_notification", side_effect=Exception("Email delivery service timeout"))
 def test_appointment_confirmed_even_if_notification_raises_exception(mock_notify, client, db_session):
-    # Appt 2 is pending
     response = client.post("/api/appointments/2/confirm", json={"expected_version": 1})
     assert response.status_code == 200
     assert response.json()["status"] == "confirmed"
 
-    # Verify DB appointment state is successfully confirmed
     db_session.expire_all()
     appt = db_session.query(Appointment).filter(Appointment.id == 2).first()
     assert appt.status == AppointmentStatus.CONFIRMED
 
 @patch.object(NotificationService, "send_confirmation_notification")
 def test_notification_not_triggered_for_cancel(mock_notify, client):
-    # Appt 1 is confirmed
     response = client.post("/api/appointments/1/cancel", json={"expected_version": 1})
     assert response.status_code == 200
     assert not mock_notify.called
@@ -387,3 +383,120 @@ def test_notification_not_triggered_for_reschedule(mock_notify, client):
     response = client.post("/api/appointments/1/reschedule", json=payload)
     assert response.status_code == 200
     assert not mock_notify.called
+
+# ==================================================
+# PHASE 6 PROVIDER OVERLAP PROTECTION TESTS
+# ==================================================
+
+def test_confirm_overlapping_appointment_returns_409(client):
+    # Appt 1 is CONFIRMED at 2026-09-01T10:00:00Z to 10:30:00Z for provider-001.
+    # Try to confirm Appt 2 for provider-001 overlapping at 2026-09-01T10:15:00Z.
+    payload = {
+        "expected_version": 1,
+        "scheduled_start": "2026-09-01T10:15:00Z"
+    }
+    response = client.post("/api/appointments/2/confirm", json=payload)
+    assert response.status_code == 409
+    body = response.json()
+    assert body["code"] == "PROVIDER_SCHEDULE_CONFLICT"
+    assert body["message"] == "The provider already has a confirmed appointment during this time."
+
+def test_reschedule_into_occupied_slot_returns_409(client):
+    # Appt 1 is CONFIRMED at 2026-09-01T10:00:00Z to 10:30:00Z.
+    # Try rescheduling Appt 3 (CONFIRMED) to overlap with Appt 1 (e.g. 10:15:00Z).
+    payload = {
+        "expected_version": 1,
+        "scheduled_start": "2026-09-01T10:15:00Z"
+    }
+    response = client.post("/api/appointments/3/reschedule", json=payload)
+    assert response.status_code == 409
+    body = response.json()
+    assert body["code"] == "PROVIDER_SCHEDULE_CONFLICT"
+
+def test_adjacent_appointments_succeed(client):
+    # Appt 1 is CONFIRMED at 10:00:00Z to 10:30:00Z.
+    # Confirming Appt 2 at 10:30:00Z (exact end of Appt 1) MUST succeed.
+    payload = {
+        "expected_version": 1,
+        "scheduled_start": "2026-09-01T10:30:00Z"
+    }
+    response = client.post("/api/appointments/2/confirm", json=payload)
+    assert response.status_code == 200
+    assert response.json()["status"] == "confirmed"
+
+def test_different_providers_can_overlap(client):
+    # Create an appointment for a different provider at the exact same time as Appt 1
+    create_payload = {
+        "patient_id": "patient-001",
+        "patient_name": "Olivia Carter",
+        "patient_email": "olivia.carter@email.test",
+        "provider_id": "provider-002",
+        "provider_name": "Dr. Sarah Lin",
+        "appointment_type": "Cardiology Consultation",
+        "requested_start": "2026-09-01T10:00:00Z"
+    }
+    create_res = client.post("/api/appointments", json=create_payload)
+    assert create_res.status_code == 201
+    new_id = create_res.json()["id"]
+
+    # Confirming for provider-002 at 2026-09-01T10:00:00Z succeeds even though provider-001 has a confirmed slot
+    confirm_res = client.post(f"/api/appointments/{new_id}/confirm", json={"expected_version": 1})
+    assert confirm_res.status_code == 200
+    assert confirm_res.json()["status"] == "confirmed"
+
+def test_pending_appointments_do_not_block_confirmation(client):
+    # Create two pending appointments for provider-001 at the same requested time 2026-09-25T14:00:00Z
+    p1 = {
+        "patient_id": "patient-001",
+        "patient_name": "Olivia Carter",
+        "patient_email": "olivia.carter@email.test",
+        "provider_id": "provider-001",
+        "provider_name": "Dr. Ethan Brooks",
+        "appointment_type": "Checkup A",
+        "requested_start": "2026-09-25T14:00:00Z"
+    }
+    p2 = {
+        "patient_id": "patient-001",
+        "patient_name": "Olivia Carter",
+        "patient_email": "olivia.carter@email.test",
+        "provider_id": "provider-001",
+        "provider_name": "Dr. Ethan Brooks",
+        "appointment_type": "Checkup B",
+        "requested_start": "2026-09-25T14:00:00Z"
+    }
+    id1 = client.post("/api/appointments", json=p1).json()["id"]
+    id2 = client.post("/api/appointments", json=p2).json()["id"]
+
+    # Confirming the first pending appointment succeeds
+    c1 = client.post(f"/api/appointments/{id1}/confirm", json={"expected_version": 1})
+    assert c1.status_code == 200
+
+    # Confirming the second pending appointment now fails with 409 conflict
+    c2 = client.post(f"/api/appointments/{id2}/confirm", json={"expected_version": 1})
+    assert c2.status_code == 409
+    assert c2.json()["code"] == "PROVIDER_SCHEDULE_CONFLICT"
+
+def test_failed_overlap_creates_no_audit_event(client):
+    history_before = client.get("/api/appointments/2/history").json()
+    count_before = len(history_before)
+
+    # Attempt overlapping confirm
+    payload = {"expected_version": 1, "scheduled_start": "2026-09-01T10:15:00Z"}
+    res = client.post("/api/appointments/2/confirm", json=payload)
+    assert res.status_code == 409
+
+    history_after = client.get("/api/appointments/2/history").json()
+    assert len(history_after) == count_before
+
+def test_failed_overlap_does_not_increment_version(client, db_session):
+    appt_before = db_session.query(Appointment).filter(Appointment.id == 2).first()
+    v_before = appt_before.version
+
+    # Attempt overlapping confirm
+    payload = {"expected_version": 1, "scheduled_start": "2026-09-01T10:15:00Z"}
+    res = client.post("/api/appointments/2/confirm", json=payload)
+    assert res.status_code == 409
+
+    db_session.expire_all()
+    appt_after = db_session.query(Appointment).filter(Appointment.id == 2).first()
+    assert appt_after.version == v_before

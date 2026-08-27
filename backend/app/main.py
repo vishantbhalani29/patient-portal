@@ -6,7 +6,7 @@ from fastapi.responses import JSONResponse
 from app.database import engine, Base, SessionLocal
 from app.api import health, appointments
 from app.services.appointment_service import AppointmentService
-from app.exceptions import StaleAppointmentException
+from app.exceptions import StaleAppointmentException, ProviderScheduleConflictException
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -34,6 +34,16 @@ async def stale_appointment_exception_handler(request: Request, exc: StaleAppoin
             "code": "STALE_APPOINTMENT",
             "message": "This appointment was updated by another user.",
             "current_version": exc.current_version
+        }
+    )
+
+@app.exception_handler(ProviderScheduleConflictException)
+async def provider_schedule_conflict_exception_handler(request: Request, exc: ProviderScheduleConflictException):
+    return JSONResponse(
+        status_code=409,
+        content={
+            "code": "PROVIDER_SCHEDULE_CONFLICT",
+            "message": "The provider already has a confirmed appointment during this time."
         }
     )
 
