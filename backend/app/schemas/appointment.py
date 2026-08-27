@@ -35,11 +35,15 @@ class AppointmentCreateRequest(BaseModel):
 class AppointmentConfirmRequest(BaseModel):
     expected_version: int
     scheduled_start: Optional[datetime] = None
+    actor_id: Optional[str] = None
+    actor_role: Optional[str] = "provider"
 
 class AppointmentRescheduleRequest(BaseModel):
     expected_version: int
     scheduled_start: Optional[datetime] = None
     new_start: Optional[datetime] = None
+    actor_id: Optional[str] = None
+    actor_role: Optional[str] = "provider"
 
     @property
     def target_start(self) -> Optional[datetime]:
@@ -47,3 +51,5 @@ class AppointmentRescheduleRequest(BaseModel):
 
 class AppointmentCancelRequest(BaseModel):
     expected_version: int
+    actor_id: Optional[str] = None
+    actor_role: Optional[str] = "patient"

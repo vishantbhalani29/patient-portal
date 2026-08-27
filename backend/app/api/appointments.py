@@ -9,6 +9,7 @@ from app.schemas.appointment import (
     AppointmentRescheduleRequest,
     AppointmentCancelRequest,
 )
+from app.schemas.audit_event import AuditEventResponse
 from app.services.appointment_service import AppointmentService
 
 router = APIRouter()
@@ -23,6 +24,16 @@ def get_appointments(
     List appointments with optional role and user_id filtering.
     """
     return AppointmentService.get_appointments(db=db, role=role, user_id=user_id)
+
+@router.get("/appointments/{id}/history", response_model=List[AuditEventResponse])
+def get_appointment_history(
+    id: int,
+    db: Session = Depends(get_db),
+):
+    """
+    Fetch audit trail history for a given appointment.
+    """
+    return AppointmentService.get_appointment_history(db=db, appointment_id=id)
 
 @router.post("/appointments", response_model=AppointmentResponse, status_code=status.HTTP_201_CREATED)
 def create_appointment(

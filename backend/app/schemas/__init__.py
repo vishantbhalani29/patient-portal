@@ -5,6 +5,7 @@ from app.schemas.appointment import (
     AppointmentRescheduleRequest,
     AppointmentCancelRequest,
 )
+from app.schemas.audit_event import AuditEventResponse
 
 __all__ = [
     "AppointmentResponse",
@@ -12,4 +13,5 @@ __all__ = [
     "AppointmentConfirmRequest",
     "AppointmentRescheduleRequest",
     "AppointmentCancelRequest",
+    "AuditEventResponse",
 ]

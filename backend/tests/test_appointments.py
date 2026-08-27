@@ -19,7 +19,7 @@ def test_database_initialization_and_seed(db_session):
     assert "Counseling Session" in types
 
     audit_count = db_session.query(AuditEvent).count()
-    assert audit_count == 0
+    assert audit_count >= 3  # Initial seed request events
 
 def test_get_patient_appointments(client):
     response = client.get("/api/appointments?role=patient&user_id=patient-001")
@@ -152,13 +152,11 @@ def test_verify_scheduled_end_duration(client):
 # ==================================================
 
 def test_confirm_with_correct_version(client):
-    # Appt 2 is pending with version = 1
     response = client.post("/api/appointments/2/confirm", json={"expected_version": 1})
     assert response.status_code == 200
     assert response.json()["version"] == 2
 
 def test_confirm_with_stale_version_returns_409(client):
-    # Appt 2 is pending with version = 1. Pass expected_version = 99
     response = client.post("/api/appointments/2/confirm", json={"expected_version": 99})
     assert response.status_code == 409
     body = response.json()
@@ -167,7 +165,6 @@ def test_confirm_with_stale_version_returns_409(client):
     assert body["current_version"] == 1
 
 def test_cancel_with_stale_version_returns_409(client):
-    # Appt 1 is confirmed with version = 1. Pass expected_version = 99
     response = client.post("/api/appointments/1/cancel", json={"expected_version": 99})
     assert response.status_code == 409
     body = response.json()
@@ -176,7 +173,6 @@ def test_cancel_with_stale_version_returns_409(client):
     assert body["current_version"] == 1
 
 def test_reschedule_with_stale_version_returns_409(client):
-    # Appt 1 is confirmed with version = 1. Pass expected_version = 99
     payload = {"expected_version": 99, "scheduled_start": "2026-09-10T16:00:00Z"}
     response = client.post("/api/appointments/1/reschedule", json=payload)
     assert response.status_code == 409
@@ -186,50 +182,169 @@ def test_reschedule_with_stale_version_returns_409(client):
     assert body["current_version"] == 1
 
 def test_version_increments_after_confirm(client):
-    # Appt 2 is pending with version = 1
     res1 = client.post("/api/appointments/2/confirm", json={"expected_version": 1})
     assert res1.status_code == 200
     assert res1.json()["version"] == 2
-    # Second confirm with stale version 1 now fails
     res2 = client.post("/api/appointments/2/confirm", json={"expected_version": 1})
     assert res2.status_code == 409
 
 def test_version_increments_after_cancel(client):
-    # Appt 1 is confirmed with version = 1
     res1 = client.post("/api/appointments/1/cancel", json={"expected_version": 1})
     assert res1.status_code == 200
     assert res1.json()["version"] == 2
-    # Second cancel with stale version 1 now fails
     res2 = client.post("/api/appointments/1/cancel", json={"expected_version": 1})
     assert res2.status_code == 409
 
 def test_version_increments_after_reschedule(client):
-    # Appt 1 is confirmed with version = 1
     payload1 = {"expected_version": 1, "scheduled_start": "2026-09-10T16:00:00Z"}
     res1 = client.post("/api/appointments/1/reschedule", json=payload1)
     assert res1.status_code == 200
     assert res1.json()["version"] == 2
-    # Second reschedule with stale version 1 now fails
     payload2 = {"expected_version": 1, "scheduled_start": "2026-09-10T17:00:00Z"}
     res2 = client.post("/api/appointments/1/reschedule", json=payload2)
     assert res2.status_code == 409
     assert res2.json()["current_version"] == 2
 
 def test_appointment_remains_unchanged_after_409(client, db_session):
-    # Appt 1 initial state
     original = db_session.query(Appointment).filter(Appointment.id == 1).first()
     orig_status = original.status
     orig_start = original.scheduled_start
     orig_version = original.version
 
-    # Attempt mutation with stale version
     payload = {"expected_version": 999, "scheduled_start": "2026-09-25T12:00:00Z"}
     response = client.post("/api/appointments/1/reschedule", json=payload)
     assert response.status_code == 409
 
-    # Re-query DB and verify no changes occurred
     db_session.expire_all()
     unchanged = db_session.query(Appointment).filter(Appointment.id == 1).first()
     assert unchanged.status == orig_status
     assert unchanged.scheduled_start == orig_start
     assert unchanged.version == orig_version
+
+# ==================================================
+# PHASE 4 AUDIT HISTORY TESTS
+# ==================================================
+
+def test_create_appointment_creates_request_audit_event(client):
+    payload = {
+        "patient_id": "patient-001",
+        "patient_name": "Olivia Carter",
+        "patient_email": "olivia.carter@email.test",
+        "provider_id": "provider-001",
+        "provider_name": "Dr. Ethan Brooks",
+        "appointment_type": "Diagnostic Check",
+        "requested_start": "2026-09-22T09:00:00Z"
+    }
+    create_res = client.post("/api/appointments", json=payload)
+    assert create_res.status_code == 201
+    appt_id = create_res.json()["id"]
+
+    history_res = client.get(f"/api/appointments/{appt_id}/history")
+    assert history_res.status_code == 200
+    events = history_res.json()
+    assert len(events) == 1
+    event = events[0]
+    assert event["action"] == "request"
+    assert event["actor_id"] == "patient-001"
+    assert event["actor_role"] == "patient"
+    assert event["before_state"] is None
+    assert event["after_state"]["status"] == "pending"
+    assert event["after_state"]["version"] == 1
+
+def test_confirm_appointment_creates_confirm_audit_event(client):
+    # Appt 2 is pending
+    confirm_res = client.post(
+        "/api/appointments/2/confirm",
+        json={"expected_version": 1, "actor_id": "provider-001", "actor_role": "provider"}
+    )
+    assert confirm_res.status_code == 200
+
+    history_res = client.get("/api/appointments/2/history")
+    assert history_res.status_code == 200
+    events = history_res.json()
+    # Initial request event + confirm event = 2 events
+    confirm_event = events[-1]
+    assert confirm_event["action"] == "confirm"
+    assert confirm_event["actor_id"] == "provider-001"
+    assert confirm_event["actor_role"] == "provider"
+    assert confirm_event["before_state"]["status"] == "pending"
+    assert confirm_event["after_state"]["status"] == "confirmed"
+    assert confirm_event["after_state"]["version"] == 2
+
+def test_reschedule_appointment_creates_reschedule_audit_event(client):
+    payload = {
+        "expected_version": 1,
+        "scheduled_start": "2026-09-10T16:00:00Z",
+        "actor_id": "provider-001",
+        "actor_role": "provider"
+    }
+    resched_res = client.post("/api/appointments/1/reschedule", json=payload)
+    assert resched_res.status_code == 200
+
+    history_res = client.get("/api/appointments/1/history")
+    assert history_res.status_code == 200
+    events = history_res.json()
+    resched_event = events[-1]
+    assert resched_event["action"] == "reschedule"
+    assert resched_event["actor_id"] == "provider-001"
+    assert resched_event["actor_role"] == "provider"
+    assert resched_event["before_state"]["scheduled_start"].startswith("2026-09-01T10:00:00")
+    assert resched_event["after_state"]["scheduled_start"].startswith("2026-09-10T16:00:00")
+    assert resched_event["after_state"]["version"] == 2
+
+def test_cancel_appointment_creates_cancel_audit_event(client):
+    cancel_res = client.post(
+        "/api/appointments/1/cancel",
+        json={"expected_version": 1, "actor_id": "patient-001", "actor_role": "patient"}
+    )
+    assert cancel_res.status_code == 200
+
+    history_res = client.get("/api/appointments/1/history")
+    assert history_res.status_code == 200
+    events = history_res.json()
+    cancel_event = events[-1]
+    assert cancel_event["action"] == "cancel"
+    assert cancel_event["actor_id"] == "patient-001"
+    assert cancel_event["actor_role"] == "patient"
+    assert cancel_event["before_state"]["status"] == "confirmed"
+    assert cancel_event["after_state"]["status"] == "cancelled"
+
+def test_audit_events_chronological_order(client):
+    # Perform sequence on Appt 2: Confirm, then Reschedule, then Cancel
+    c1 = client.post("/api/appointments/2/confirm", json={"expected_version": 1})
+    assert c1.status_code == 200
+    r1 = client.post("/api/appointments/2/reschedule", json={"expected_version": 2, "scheduled_start": "2026-09-15T14:00:00Z"})
+    assert r1.status_code == 200
+    x1 = client.post("/api/appointments/2/cancel", json={"expected_version": 3})
+    assert x1.status_code == 200
+
+    history = client.get("/api/appointments/2/history").json()
+    actions = [e["action"] for e in history]
+    assert actions == ["request", "confirm", "reschedule", "cancel"]
+
+def test_failed_stale_version_mutation_creates_no_audit_event(client):
+    initial_history = client.get("/api/appointments/1/history").json()
+    initial_count = len(initial_history)
+
+    # Attempt stale confirm
+    stale_res = client.post("/api/appointments/1/confirm", json={"expected_version": 999})
+    assert stale_res.status_code == 409
+
+    after_history = client.get("/api/appointments/1/history").json()
+    assert len(after_history) == initial_count
+
+def test_failed_business_rule_mutation_creates_no_audit_event(client):
+    initial_history = client.get("/api/appointments/2/history").json()
+    initial_count = len(initial_history)
+
+    # Attempt illegal cancel on pending appt
+    invalid_res = client.post("/api/appointments/2/cancel", json={"expected_version": 1})
+    assert invalid_res.status_code == 400
+
+    after_history = client.get("/api/appointments/2/history").json()
+    assert len(after_history) == initial_count
+
+def test_history_endpoint_returns_404_for_non_existent_appointment(client):
+    response = client.get("/api/appointments/99999/history")
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Appointment not found"

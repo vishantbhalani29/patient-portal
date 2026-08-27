@@ -1,9 +1,11 @@
+import json
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 from sqlalchemy.orm import Session
 from fastapi import HTTPException
 
 from app.models.appointment import Appointment, AppointmentStatus
+from app.models.audit_event import AuditEvent
 from app.schemas.appointment import (
     AppointmentCreateRequest,
     AppointmentConfirmRequest,
@@ -13,6 +15,54 @@ from app.schemas.appointment import (
 from app.exceptions import StaleAppointmentException
 
 class AppointmentService:
+    @staticmethod
+    def _capture_snapshot(appointment: Appointment) -> dict:
+        """
+        Captures a clean business state snapshot of an appointment.
+        """
+        if not appointment:
+            return None
+        return {
+            "id": appointment.id,
+            "patient_id": appointment.patient_id,
+            "patient_name": appointment.patient_name,
+            "patient_email": appointment.patient_email,
+            "provider_id": appointment.provider_id,
+            "provider_name": appointment.provider_name,
+            "appointment_type": appointment.appointment_type,
+            "reason": appointment.reason,
+            "requested_start": appointment.requested_start.isoformat() if appointment.requested_start else None,
+            "scheduled_start": appointment.scheduled_start.isoformat() if appointment.scheduled_start else None,
+            "scheduled_end": appointment.scheduled_end.isoformat() if appointment.scheduled_end else None,
+            "status": appointment.status.value if hasattr(appointment.status, "value") else str(appointment.status),
+            "version": appointment.version,
+        }
+
+    @staticmethod
+    def _log_audit_event(
+        db: Session,
+        appointment_id: int,
+        actor_id: str,
+        actor_role: str,
+        action: str,
+        before_state: Optional[dict],
+        after_state: dict,
+    ) -> AuditEvent:
+        """
+        Inserts an append-only audit event record into the session.
+        Must be committed within the parent transaction.
+        """
+        audit_event = AuditEvent(
+            appointment_id=appointment_id,
+            actor_id=actor_id,
+            actor_role=actor_role,
+            action=action,
+            before_state=json.dumps(before_state) if before_state else None,
+            after_state=json.dumps(after_state) if after_state else None,
+        )
+        db.add(audit_event)
+        return audit_event
+
     @staticmethod
     def _verify_version(appointment: Appointment, expected_version: int) -> None:
         """
@@ -39,6 +89,17 @@ class AppointmentService:
         return appointment
 
     @staticmethod
+    def get_appointment_history(db: Session, appointment_id: int) -> List[AuditEvent]:
+        # Raises 404 if appointment doesn't exist
+        AppointmentService.get_appointment_by_id(db, appointment_id)
+        return (
+            db.query(AuditEvent)
+            .filter(AuditEvent.appointment_id == appointment_id)
+            .order_by(AuditEvent.created_at.asc(), AuditEvent.id.asc())
+            .all()
+        )
+
+    @staticmethod
     def create_appointment(db: Session, request: AppointmentCreateRequest) -> Appointment:
         scheduled_start = request.requested_start
         scheduled_end = scheduled_start + timedelta(minutes=30)
@@ -58,6 +119,19 @@ class AppointmentService:
             version=1,
         )
         db.add(appointment)
+        db.flush()  # Flush to generate appointment.id for audit event foreign key
+
+        after_state = AppointmentService._capture_snapshot(appointment)
+        AppointmentService._log_audit_event(
+            db=db,
+            appointment_id=appointment.id,
+            actor_id=request.patient_id,
+            actor_role="patient",
+            action="request",
+            before_state=None,
+            after_state=after_state,
+        )
+
         db.commit()
         db.refresh(appointment)
         return appointment
@@ -72,6 +146,8 @@ class AppointmentService:
         if appointment.status != AppointmentStatus.PENDING:
             raise HTTPException(status_code=400, detail="Only pending appointments can be confirmed.")
         
+        before_state = AppointmentService._capture_snapshot(appointment)
+
         if request.scheduled_start:
             appointment.scheduled_start = request.scheduled_start
             appointment.scheduled_end = request.scheduled_start + timedelta(minutes=30)
@@ -83,6 +159,20 @@ class AppointmentService:
         appointment.version += 1
         appointment.updated_at = datetime.now(timezone.utc)
         
+        after_state = AppointmentService._capture_snapshot(appointment)
+        actor_id = request.actor_id or appointment.provider_id
+        actor_role = request.actor_role or "provider"
+        
+        AppointmentService._log_audit_event(
+            db=db,
+            appointment_id=appointment.id,
+            actor_id=actor_id,
+            actor_role=actor_role,
+            action="confirm",
+            before_state=before_state,
+            after_state=after_state,
+        )
+
         db.commit()
         db.refresh(appointment)
         return appointment
@@ -98,11 +188,27 @@ class AppointmentService:
         if not target_start:
             raise HTTPException(status_code=400, detail="scheduled_start is required for rescheduling.")
 
+        before_state = AppointmentService._capture_snapshot(appointment)
+
         appointment.scheduled_start = target_start
         appointment.scheduled_end = target_start + timedelta(minutes=30)
         appointment.version += 1
         appointment.updated_at = datetime.now(timezone.utc)
         
+        after_state = AppointmentService._capture_snapshot(appointment)
+        actor_id = request.actor_id or appointment.provider_id
+        actor_role = request.actor_role or "provider"
+
+        AppointmentService._log_audit_event(
+            db=db,
+            appointment_id=appointment.id,
+            actor_id=actor_id,
+            actor_role=actor_role,
+            action="reschedule",
+            before_state=before_state,
+            after_state=after_state,
+        )
+
         db.commit()
         db.refresh(appointment)
         return appointment
@@ -117,10 +223,26 @@ class AppointmentService:
         if appointment.status != AppointmentStatus.CONFIRMED:
             raise HTTPException(status_code=400, detail="Only confirmed appointments can be cancelled.")
         
+        before_state = AppointmentService._capture_snapshot(appointment)
+
         appointment.status = AppointmentStatus.CANCELLED
         appointment.version += 1
         appointment.updated_at = datetime.now(timezone.utc)
         
+        after_state = AppointmentService._capture_snapshot(appointment)
+        actor_id = request.actor_id or appointment.patient_id
+        actor_role = request.actor_role or "patient"
+
+        AppointmentService._log_audit_event(
+            db=db,
+            appointment_id=appointment.id,
+            actor_id=actor_id,
+            actor_role=actor_role,
+            action="cancel",
+            before_state=before_state,
+            after_state=after_state,
+        )
+
         db.commit()
         db.refresh(appointment)
         return appointment
@@ -128,7 +250,7 @@ class AppointmentService:
     @staticmethod
     def seed_data(db: Session) -> None:
         """
-        Idempotent database seeding for original demo data.
+        Idempotent database seeding for original demo data with initial audit events.
         """
         if db.query(Appointment).first() is not None:
             return  # Seed data already exists
@@ -180,4 +302,18 @@ class AppointmentService:
         ]
 
         db.add_all(seed_appointments)
+        db.flush()
+
+        for appt in seed_appointments:
+            snapshot = AppointmentService._capture_snapshot(appt)
+            AppointmentService._log_audit_event(
+                db=db,
+                appointment_id=appt.id,
+                actor_id=appt.patient_id,
+                actor_role="patient",
+                action="request",
+                before_state=None,
+                after_state=snapshot,
+            )
+
         db.commit()
