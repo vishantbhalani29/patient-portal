@@ -1,6 +1,8 @@
 from datetime import datetime, timedelta
+from unittest.mock import patch
 from app.models.appointment import Appointment, AppointmentStatus
 from app.models.audit_event import AuditEvent
+from app.services.notification_service import NotificationService
 
 def test_database_initialization_and_seed(db_session):
     appointments = db_session.query(Appointment).all()
@@ -252,7 +254,6 @@ def test_create_appointment_creates_request_audit_event(client):
     assert event["after_state"]["version"] == 1
 
 def test_confirm_appointment_creates_confirm_audit_event(client):
-    # Appt 2 is pending
     confirm_res = client.post(
         "/api/appointments/2/confirm",
         json={"expected_version": 1, "actor_id": "provider-001", "actor_role": "provider"}
@@ -262,7 +263,6 @@ def test_confirm_appointment_creates_confirm_audit_event(client):
     history_res = client.get("/api/appointments/2/history")
     assert history_res.status_code == 200
     events = history_res.json()
-    # Initial request event + confirm event = 2 events
     confirm_event = events[-1]
     assert confirm_event["action"] == "confirm"
     assert confirm_event["actor_id"] == "provider-001"
@@ -310,7 +310,6 @@ def test_cancel_appointment_creates_cancel_audit_event(client):
     assert cancel_event["after_state"]["status"] == "cancelled"
 
 def test_audit_events_chronological_order(client):
-    # Perform sequence on Appt 2: Confirm, then Reschedule, then Cancel
     c1 = client.post("/api/appointments/2/confirm", json={"expected_version": 1})
     assert c1.status_code == 200
     r1 = client.post("/api/appointments/2/reschedule", json={"expected_version": 2, "scheduled_start": "2026-09-15T14:00:00Z"})
@@ -326,7 +325,6 @@ def test_failed_stale_version_mutation_creates_no_audit_event(client):
     initial_history = client.get("/api/appointments/1/history").json()
     initial_count = len(initial_history)
 
-    # Attempt stale confirm
     stale_res = client.post("/api/appointments/1/confirm", json={"expected_version": 999})
     assert stale_res.status_code == 409
 
@@ -337,7 +335,6 @@ def test_failed_business_rule_mutation_creates_no_audit_event(client):
     initial_history = client.get("/api/appointments/2/history").json()
     initial_count = len(initial_history)
 
-    # Attempt illegal cancel on pending appt
     invalid_res = client.post("/api/appointments/2/cancel", json={"expected_version": 1})
     assert invalid_res.status_code == 400
 
@@ -348,3 +345,45 @@ def test_history_endpoint_returns_404_for_non_existent_appointment(client):
     response = client.get("/api/appointments/99999/history")
     assert response.status_code == 404
     assert response.json()["detail"] == "Appointment not found"
+
+# ==================================================
+# PHASE 5 ASYNCHRONOUS NOTIFICATION TESTS
+# ==================================================
+
+@patch.object(NotificationService, "send_confirmation_notification")
+def test_confirm_endpoint_schedules_notification(mock_notify, client):
+    # Appt 2 is pending
+    response = client.post("/api/appointments/2/confirm", json={"expected_version": 1})
+    assert response.status_code == 200
+    assert mock_notify.called
+    mock_notify.assert_called_once_with(
+        appointment_id=2,
+        patient_name="Olivia Carter",
+        patient_email="olivia.carter@email.test"
+    )
+
+@patch.object(NotificationService, "send_confirmation_notification", side_effect=Exception("Email delivery service timeout"))
+def test_appointment_confirmed_even_if_notification_raises_exception(mock_notify, client, db_session):
+    # Appt 2 is pending
+    response = client.post("/api/appointments/2/confirm", json={"expected_version": 1})
+    assert response.status_code == 200
+    assert response.json()["status"] == "confirmed"
+
+    # Verify DB appointment state is successfully confirmed
+    db_session.expire_all()
+    appt = db_session.query(Appointment).filter(Appointment.id == 2).first()
+    assert appt.status == AppointmentStatus.CONFIRMED
+
+@patch.object(NotificationService, "send_confirmation_notification")
+def test_notification_not_triggered_for_cancel(mock_notify, client):
+    # Appt 1 is confirmed
+    response = client.post("/api/appointments/1/cancel", json={"expected_version": 1})
+    assert response.status_code == 200
+    assert not mock_notify.called
+
+@patch.object(NotificationService, "send_confirmation_notification")
+def test_notification_not_triggered_for_reschedule(mock_notify, client):
+    payload = {"expected_version": 1, "scheduled_start": "2026-09-10T16:00:00Z"}
+    response = client.post("/api/appointments/1/reschedule", json=payload)
+    assert response.status_code == 200
+    assert not mock_notify.called

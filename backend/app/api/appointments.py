@@ -1,5 +1,5 @@
 from typing import List, Optional
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, Query, BackgroundTasks, status
 from sqlalchemy.orm import Session
 from app.database import get_db
 from app.schemas.appointment import (
@@ -11,6 +11,7 @@ from app.schemas.appointment import (
 )
 from app.schemas.audit_event import AuditEventResponse
 from app.services.appointment_service import AppointmentService
+from app.services.notification_service import NotificationService
 
 router = APIRouter()
 
@@ -49,12 +50,20 @@ def create_appointment(
 def confirm_appointment(
     id: int,
     request: AppointmentConfirmRequest,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ):
     """
-    Confirm a pending appointment.
+    Confirm a pending appointment and schedule background notification.
     """
-    return AppointmentService.confirm_appointment(db=db, appointment_id=id, request=request)
+    appointment = AppointmentService.confirm_appointment(db=db, appointment_id=id, request=request)
+    background_tasks.add_task(
+        NotificationService.safe_send_confirmation_notification,
+        appointment_id=appointment.id,
+        patient_name=appointment.patient_name,
+        patient_email=appointment.patient_email,
+    )
+    return appointment
 
 @router.post("/appointments/{id}/reschedule", response_model=AppointmentResponse)
 def reschedule_appointment(
